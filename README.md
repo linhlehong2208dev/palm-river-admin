@@ -1,62 +1,149 @@
-# vote-frontend
+# Palm River Admin
 
-Giao diện bình chọn tiết mục văn nghệ, style Kahoot, mobile-first. Dùng chung
-với `vote-backend` đã có sẵn (xem thư mục `backend-patch/` đi kèm để thêm
-tính năng Pause/Resume vào backend).
+Ứng dụng Admin là frontend riêng, đăng nhập bằng Google qua Supabase Auth. Tài
+liệu này mô tả kiến trúc mục tiêu đã thống nhất và phân biệt rõ với những phần
+còn phải triển khai trước khi đưa Admin vào sử dụng.
 
-## Cài đặt
+## Cấu trúc project
 
-```bash
-npm install
-cp .env.example .env
-# Điền VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY (lấy trong Supabase > Settings > API,
-# dùng anon key, KHÔNG dùng service role key), VITE_API_BASE_URL trỏ tới vote-backend.
-npm run dev
+Đây là ứng dụng JavaScript/JSX dùng Vite. Entrypoint duy nhất là
+`index.html → src/main.jsx → src/App.jsx`; `vite.config.js` là cấu hình Vite
+duy nhất. Các file TSX/Tailwind cũ đã được loại bỏ để không còn hai phiên bản
+app và hai bộ cấu hình song song.
+
+- `src/auth.jsx`, `src/supabase.js`: Supabase Auth và session Google OAuth.
+- `src/api.js`: client gọi API Worker với access token.
+- `src/pages/`: các màn hình Overview, Leads, ZNS, Realtime, Team và Login.
+- `src/ui.jsx`, `src/styles.css`: component tiện ích và stylesheet dùng chung.
+- `public/assets/`: logo/icon và ảnh được frontend sử dụng.
+- `ADMIN-API-CONTRACT.md`: hợp đồng API mục tiêu giữa frontend và Worker.
+- `DEPLOYMENT.md`: hướng dẫn build/deploy frontend.
+
+Lệnh `npm run build` chạy Vite để tạo static assets trong `dist/`. Không có
+TypeScript compiler, Tailwind hay PostCSS trong build hiện tại.
+
+## Kiến trúc mục tiêu
+
+```text
+Admin frontend
+  ├─ Đăng nhập Google qua Supabase Auth
+  ├─ Gửi Supabase access token đến Cloudflare Worker
+  └─ Hiển thị dữ liệu theo role; lead chỉ xem và xuất CSV
+       │
+       ▼
+Cloudflare Worker — API riêng cho Admin
+  ├─ Xác minh access token với Supabase
+  ├─ Đọc danh sách admin/role từ Supabase và phân quyền ở server
+  ├─ Đọc/ghi dữ liệu quản trị (ví dụ danh sách admin) trong Supabase
+  └─ Chuyển tiếp yêu cầu đọc lead đến Apps Script API riêng
+       │
+       ├──────────────────────► Supabase
+       │                         Danh sách admin, role và dữ liệu quản trị
+       ▼
+Apps Script API chỉ đọc
+  ├─ Xác thực request nội bộ do Worker gửi
+  └─ Chỉ đọc tab RAW_LEAD, không sửa lead hay quản lý admin
+       │
+       ▼
+Google Sheet — RAW_LEAD
+  Nguồn dữ liệu lead chính thức, 14 cột
+
+Luồng ghi lead hiện tại — giữ nguyên, độc lập với Admin:
+Landing page → Worker POST hiện tại → Apps Script doPost() → RAW_LEAD
 ```
 
-Mở `http://localhost:5173/?session=<sessionId>` cho người xem,
-`http://localhost:5173/admin?session=<sessionId>` cho MC/admin.
+## Ranh giới dữ liệu và quyền
 
-## Luồng hoạt động
+- **Supabase Auth** xác thực người dùng Admin qua Google OAuth. Frontend gửi
+  access token đến Worker; việc đăng nhập thành công tự nó không cấp quyền
+  Admin.
+- **Supabase database** lưu danh sách email admin, role và dữ liệu quản trị.
+  Worker là nơi xác minh role cho mỗi request; không tin vào role do frontend
+  tự gửi hoặc tự tính.
+- **Admin frontend** chỉ cho phép xem danh sách/chi tiết lead và xuất CSV.
+  Không cung cấp thao tác sửa lead hoặc cập nhật Sheet. Việc quản lý admin có
+  thể thực hiện trong giao diện qua API Worker; Worker mới được quyền ghi danh
+  sách admin/role vào Supabase.
+- **Apps Script API riêng cho Admin** chỉ đọc dữ liệu từ `RAW_LEAD`. API này
+  phải xác thực request nội bộ từ Worker bằng một bí mật dùng riêng giữa Worker
+  và Apps Script; bí mật không được đặt trong frontend, mã nguồn công khai hoặc
+  repository.
+- **Apps Script `doPost()` hiện tại** tiếp tục nhận luồng ghi lead từ Worker
+  như cũ. Không thay đổi giao thức hoặc hành vi này khi triển khai API đọc cho
+  Admin.
+- Các thông tin xác thực như Supabase service-role key và bí mật Worker–Apps
+  Script chỉ được lưu phía server dưới dạng secret. Không đặt chúng trong biến
+  `VITE_*`.
 
-1. Người dùng đăng nhập bằng magic link email (Supabase Auth OTP) — email phải
-   thuộc domain được backend cho phép (`ALLOWED_EMAIL_DOMAIN`), nếu không sẽ bị
-   backend trả về lỗi `forbidden_domain` khi gọi API đầu tiên.
-2. Sau khi đăng nhập, app gọi `POST /api/join` (idempotent) rồi bắt đầu poll
-   `GET /api/session/:id` mỗi 1.5s để đồng bộ trạng thái với các máy khác —
-   không dùng WebSocket, cùng triết lý polling ngắn mà backend đã dùng ở
-   `closeSessionCron.ts`, nên không cần thêm hạ tầng realtime.
-3. Trạng thái `session.status` quyết định màn hình:
-   - `pending`: câu hỏi hiện ra nhưng đáp án bị khóa (chờ MC bấm Bắt đầu).
-   - `active`: vòng đếm ngược chạy (tick mượt ở client giữa các lần poll dựa
-     trên `ended_at` trả về từ server), đáp án mở để chọn/đổi.
-   - `paused`: vòng đếm đứng yên ở `remaining_seconds`, đáp án bị khóa lại.
-   - `closed`: tự động gọi `GET /api/results/:id` và hiển thị bảng xếp hạng
-     ngay lập tức — đây là phần "hiển thị kết quả liền" mà không cần MC làm gì
-     thêm, mọi người tham gia đều tự thấy kết quả khi trạng thái chuyển sang
-     `closed` (dù do hết giờ tự động qua cron, hay do MC bấm "Kết thúc ngay").
-4. Trang admin (`/admin`) có thêm các nút Bắt đầu / Tạm dừng / Tiếp tục / Kết
-   thúc ngay, gọi thẳng các endpoint tương ứng ở `vote-backend` (yêu cầu
-   `isAdmin`).
+## Trạng thái hiện tại và phần cần làm
 
-## Vì sao poll thay vì Supabase Realtime?
+Kiến trúc trên là **mục tiêu**, chưa có nghĩa các endpoint đã được triển khai.
+Worker hiện có trong `be/lead-webhook-worker` là Worker nhận lead công khai;
+không mặc định rằng Worker này đã có API Admin, xác minh Supabase JWT, role,
+hay API đọc Sheet.
 
-Để không phải mở thêm RLS policies cho `sessions`/`selections`/`votes` (hiện
-tại chỉ backend service-role được đọc/ghi các bảng này) và giữ nguyên mô hình
-bảo mật đang có: mọi truy cập dữ liệu đều đi qua backend, frontend chỉ dùng
-Supabase Auth để lấy JWT. Poll 1.5s là đủ mượt cho quy mô ~150 người và không
-tạo tải đáng kể.
+Frontend Admin hiện gọi các endpoint `/admin/api/*` như mô tả trong
+[`ADMIN-API-CONTRACT.md`](./ADMIN-API-CONTRACT.md). Trước production cần kiểm
+tra và điều chỉnh frontend để:
 
-## Trạng thái session cần thêm ở backend
+1. Chỉ giữ các chức năng phù hợp với quyền chỉ đọc lead.
+2. Đọc danh sách admin/role từ API được Worker bảo vệ; không dùng danh sách
+   frontend làm cơ chế phân quyền.
+3. Loại bỏ hoặc ẩn chức năng ghi/cập nhật lead. Chỉ bật quản lý admin khi các
+   endpoint Worker lưu và kiểm tra quyền qua Supabase đã được triển khai.
+4. Chỉ kết nối các màn hình dashboard, ZNS, realtime hoặc team nếu xác định rõ
+   nguồn dữ liệu/API tương ứng và chúng đã có kiểm soát quyền server-side.
 
-Xem `backend-patch/` — cần thêm cột `remaining_seconds`, `paused_at` và trạng
-thái `pending`/`paused` vào bảng `sessions`, cùng 2 endpoint mới
-`/session/:id/pause` và `/session/:id/resume`. Khi tạo session mới (hiện chưa
-có endpoint tạo — đang thao tác tay trên Supabase), nhớ set `status = 'pending'`
-làm mặc định.
+Các phần hạ tầng/API tiếp theo cần xác định và triển khai riêng:
 
-## Build production
+1. **Supabase:** chốt schema/bảng lưu admin và role, quy tắc ai được thêm hoặc
+   thu hồi admin, chính sách RLS và thao tác server-side qua Worker.
+2. **Cloudflare Worker Admin API:** xác minh token Supabase; trả `401` khi token
+   thiếu/không hợp lệ, `403` khi người dùng không được phép; triển khai các API
+   đọc cần thiết và ghi dữ liệu quản trị vào Supabase.
+3. **Apps Script API chỉ đọc:** tạo endpoint đọc `RAW_LEAD`, xác thực request
+   từ Worker, giới hạn thao tác ở đọc dữ liệu; giữ nguyên `doPost()` hiện tại.
+4. **Tích hợp frontend:** xác nhận route, response shape, phân trang/lọc, xuất
+   CSV và CORS cho đúng domain Admin.
+5. **Triển khai:** cấu hình Supabase OAuth redirect, Worker secrets và
+   `VITE_API_BASE`; deploy frontend lên domain Admin sau khi API đã sẵn sàng.
 
-```bash
-npm run build   # ra thư mục dist/, deploy lên Vercel/Netlify tuỳ ý
+## Đăng nhập và cấu hình frontend
+
+Frontend sử dụng Supabase URL và anon/publishable key:
+
+```env
+VITE_SUPABASE_URL=https://<project-ref>.supabase.co
+VITE_SUPABASE_ANON_KEY=<anon-or-publishable-key>
+VITE_APP_URL=https://admin.canho-palmriver.vn
+VITE_API_BASE=https://<admin-api-worker-domain>
 ```
+
+`VITE_APP_URL` là URL quay về sau Google OAuth. URL này phải được thêm vào danh
+sách redirect URLs cho phép trong Supabase Auth và phải trỏ đến frontend Admin
+đã deploy. `VITE_API_BASE` trỏ đến API Worker có các route `/admin/api/*`;
+không dùng URL Apps Script trực tiếp từ browser.
+
+Không chia sẻ hoặc commit `.env` có credential thật. Frontend chỉ được chứa
+Supabase anon/publishable key; service-role key và bí mật nội bộ chỉ được cấu
+hình ở server/Worker.
+
+## Kiểm tra trước khi phát hành
+
+- [ ] Google OAuth quay về đúng domain Admin qua Supabase.
+- [ ] Worker từ chối request thiếu/sai token (`401`) và người không có quyền
+      (`403`).
+- [ ] Người dùng có role phù hợp chỉ đọc được dữ liệu được phép; kiểm tra quyền
+      ở Worker, không chỉ ở UI.
+- [ ] Apps Script API Admin chỉ đọc tab `RAW_LEAD` và từ chối request không có
+      xác thực nội bộ hợp lệ.
+- [ ] Admin xem được dữ liệu và xuất CSV; không có API/UI sửa lead.
+- [ ] Dữ liệu admin/role được lưu ở Supabase, không ghi vào Google Sheet.
+- [ ] Landing page vẫn ghi lead qua Worker POST và Apps Script `doPost()` như
+      trước; đã kiểm tra không gây hồi quy.
+- [ ] CORS chỉ cho phép đúng origin Admin; không mở wildcard cho API quản trị.
+- [ ] `npm run build` thành công và kiểm tra thực tế trên môi trường staging.
+
+README này ghi lại kiến trúc và kế hoạch tích hợp; không khẳng định Worker,
+Apps Script, Supabase schema, DNS hay production đã được thay đổi hoặc triển
+khai.
